@@ -284,9 +284,10 @@ class NeuronRecycler(BaseRecycler):
         outgoing_scale: scalar for outgoing weights.
     """
 
-    def __init__(self, all_layers_names, reset_layer_names, next_layers, init_method_outgoing='zero', weight_scaling=False,
-                 incoming_scale=1.0, outgoing_scale=1.0):
-        super(NeuronRecycler, self).__init__(all_layers_names)
+    def __init__(self, all_layers_names, reset_layer_names, next_layers, init_method_outgoing='zero',
+                 weight_scaling=False, incoming_scale=1.0, outgoing_scale=1.0,
+                 reset_period=200_000):
+        super(NeuronRecycler, self).__init__(all_layers_names, reset_period=reset_period)
         self.init_method_outgoing = init_method_outgoing
         self.weight_scaling = weight_scaling
         self.incoming_scale = incoming_scale

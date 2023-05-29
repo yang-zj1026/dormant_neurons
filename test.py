@@ -4,19 +4,29 @@ from weight_recycler import NeuronRecycler
 
 
 def test_neuron_recycler(model, all_layer_names, reset_layers, next_layers, optimizer):
-    weight_recycler = NeuronRecycler(all_layer_names, reset_layers, next_layers)
-    test_input = torch.randn(8, 10)
-    test_output = model(test_input)
-    intermediates = model.intermediate_results
+    weight_recycler = NeuronRecycler(all_layer_names, reset_layers, next_layers, reset_period=100)
+    loss_func = nn.CrossEntropyLoss()
+    for training_step in range(0, 201):
+        optimizer.zero_grad()
 
-    log_dict_neurons = (weight_recycler.maybe_log_deadneurons(0, intermediates))
-    old_online_params = model.state_dict()
-    online_params = weight_recycler.maybe_update_weights(0, intermediates, old_online_params)
+        test_input = torch.randn(8, 10)
+        test_output = model(test_input)
+        test_label = torch.randn(8, 4)
 
-    online_params = weight_recycler.maybe_update_weights(200_000, intermediates, online_params)
+        loss = loss_func(test_output, test_label)
+        loss.backward()
+        optimizer.step()
 
-    model.load_state_dict(online_params)
+        intermediates = model.intermediate_results
+        log_dict_neurons = (weight_recycler.maybe_log_deadneurons(0, intermediates))
+        old_online_params = model.state_dict()
+        online_params = weight_recycler.maybe_update_weights(training_step, intermediates, old_online_params)
+
+        model.load_state_dict(online_params)
+
     # Reset momentum in optimizer
+    optimizer_state = optimizer.state_dict()
+    print(optimizer_state['state'].keys())
 
 
 class MyModel(nn.Module):
@@ -42,7 +52,7 @@ class MyModel(nn.Module):
         )
 
         self.feed_forward = self.feed_forward = nn.Sequential(
-            nn.Linear(30, 10),
+            nn.Linear(90, 4),
             nn.ReLU(),
         )
 
@@ -54,7 +64,9 @@ class MyModel(nn.Module):
                                                          'neighbor_embed_layer')
         obstacle_embed = self.forward_with_intermediates(x, self.obstacle_embed_layer,
                                                          'obstacle_embed_layer')
-        return x
+        embeds = torch.cat([self_embed, neighbor_embed, obstacle_embed], dim=1)
+        out = self.feed_forward(embeds)
+        return out
 
     def forward_with_intermediates(self, x, module, module_name):
         key = ''
