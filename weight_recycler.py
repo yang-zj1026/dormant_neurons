@@ -4,8 +4,6 @@ import torch.nn as nn
 import optax
 import logging
 
-from utils import tensor_tree_map, flatten_dict, unflatten_dict, split_key
-
 
 def leastk_mask(scores, ones_fraction):
     """Given a tensor of scores creates a binary mask.
@@ -47,7 +45,7 @@ def weight_reinit_zero(param, mask):
         return param
 
 
-def weight_reinit_random(param, mask, key, weight_scaling=False, scale=1.0, weights_type='incoming'):
+def weight_reinit_random(param, mask, weights_type='incoming', weight_scaling=False, scale=1.0):
     """Randomly reinit recycled weights and may scale its norm.
 
     If scaling applied, the norm of recycled weights equals
@@ -56,7 +54,6 @@ def weight_reinit_random(param, mask, key, weight_scaling=False, scale=1.0, weig
     Args:
         param: current param
         mask: incoming/outgoing mask for recycled weights
-        key: random key to generate new random weights
         weight_scaling: if true, scale recycled weights with the norm of non-recycled
         scale: scale to multiply the new weights norm.
         weights_type: incoming or outgoing weights
@@ -64,10 +61,8 @@ def weight_reinit_random(param, mask, key, weight_scaling=False, scale=1.0, weig
     Returns:
         params: new params after weight recycle.
     """
-    if mask is None or key is None:
-        return param
 
-    new_param = nn.init.xavier_uniform_(torch.empty_like(param)).to(key.device)
+    new_param = nn.init.xavier_uniform_(torch.empty_like(param)).to(param.device)
 
     if weight_scaling:
         axes = list(range(param.ndim))
@@ -140,17 +135,17 @@ class BaseRecycler:
     def is_update_iter(self, step):
         return step > 0 and (step % self.reset_period == 0)
 
-    def update_weights(self, intermediates, params, key, opt_state):
+    def update_weights(self, intermediates, params):
         raise NotImplementedError
 
-    def maybe_update_weights(self, update_step, intermediates, params, key, opt_state):
+    def maybe_update_weights(self, update_step, intermediates, params):
         self._last_update_step = update_step
         if self.is_reset(update_step):
-            new_params, new_opt_state = self.update_weights(intermediates, params, key, opt_state)
+            new_params = self.update_weights(intermediates, params)
         else:
-            new_params, new_opt_state = params, opt_state
+            new_params = params
 
-        return new_params, new_opt_state
+        return new_params
 
     def is_reset(self, update_step):
         del update_step
@@ -169,8 +164,7 @@ class BaseRecycler:
         else:
             return None
 
-    def intersected_dead_neurons_with_last_reset(self, intermediates,
-                                                 update_step):
+    def intersected_dead_neurons_with_last_reset(self, intermediates, update_step):
         if self.is_logging_step(update_step):
             log_dict = self.log_intersected_dead_neurons(intermediates)
             return log_dict
@@ -187,8 +181,8 @@ class BaseRecycler:
         Returns:
           log_dict: dict contains the percentage of intersection
         """
-        score_tree = tensor_tree_map(self.estimate_neuron_score, intermediates)
-        neuron_score_dict = flatten_dict(score_tree, sep='/')
+
+        neuron_score_dict = {key: self.estimate_neuron_score(intermediates[key]) for key in self.reset_layers}
 
         if self.prev_neuron_score is None:
             self.prev_neuron_score = neuron_score_dict
@@ -198,19 +192,18 @@ class BaseRecycler:
             for prev_k_score, current_k_score in zip(self.prev_neuron_score.items(), neuron_score_dict.items()):
                 prev_k, prev_score = prev_k_score
                 current_k, score = current_k_score
-                prev_score, score = prev_score[0], score[0]
                 prev_mask = prev_score <= self.dead_neurons_threshold
-                intersected_mask = (prev_mask) & (score <= self.dead_neurons_threshold)
+                intersected_mask = prev_mask & (score <= self.dead_neurons_threshold)
                 prev_dead_count = torch.count_nonzero(prev_mask)
                 intersected_count = torch.count_nonzero(intersected_mask)
 
                 percent = (float(intersected_count) / prev_dead_count) if prev_dead_count else 0.0
-                log_dict[f'dead_intersected_percent/{current_k[:-9]}'] = float(percent) * 100.
+                log_dict[f'dead_intersected_percent/{current_k}'] = float(percent) * 100.
 
                 nondead_mask = score > self.dead_neurons_threshold
 
-                log_dict[f'mean_score_recycled/{current_k[:-9]}'] = float(torch.mean(score[prev_mask]))
-                log_dict[f'mean_score_nondead/{current_k[:-9]}'] = float(torch.mean(score[nondead_mask]))
+                log_dict[f'mean_score_recycled/{current_k}'] = float(torch.mean(score[prev_mask]))
+                log_dict[f'mean_score_nondead/{current_k}'] = float(torch.mean(score[nondead_mask]))
 
             self.prev_neuron_score = neuron_score_dict
 
@@ -230,33 +223,27 @@ class BaseRecycler:
           log_dict_neurons
         """
 
-        def log_dict(score, score_type):
+        def log_dict(score_dict):
             total_neurons, total_deadneurons = 0., 0.
-            score_dict = flatten_dict(score, sep='/')
 
             log_dict = {}
             for k, m in score_dict.items():
-                if 'final_layer' in k:
-                    continue
-                m = m[0]
                 layer_size = float(torch.numel(m))
                 deadneurons_count = torch.count_nonzero(m <= self.dead_neurons_threshold).item()
                 total_neurons += layer_size
                 total_deadneurons += deadneurons_count
-                log_dict[f'dead_{score_type}_percentage/{k[:-9]}'] = (deadneurons_count / layer_size) * 100.
-                log_dict[f'dead_{score_type}_count/{k[:-9]}'] = float(deadneurons_count)
 
-            log_dict[f'{score_type}/total'] = total_neurons
-            log_dict[f'{score_type}/deadcount'] = float(total_deadneurons)
-            log_dict[f'dead_{score_type}_percentage'] = (float(total_deadneurons) / total_neurons) * 100.
+            log_dict[f'Dormant/total'] = total_neurons
+            log_dict[f'Dormant/deadcount'] = float(total_deadneurons)
+            log_dict[f'Dormant/dormant_percentage'] = (float(total_deadneurons) / total_neurons)
             return log_dict
 
-        neuron_score = tensor_tree_map(self.estimate_neuron_score, intermediates)
-        log_dict_neurons = log_dict(neuron_score, 'feature')
+        neuron_score = {k: self.estimate_neuron_score(intermediates[k]) for k in self.reset_layers}
+        log_dict_neurons = log_dict(neuron_score)
 
         return log_dict_neurons
 
-    def estimate_neuron_score(self, activation, is_cbp=False):
+    def estimate_neuron_score(self, activation):
         """
         Calculates neuron score based on absolute value of activation.
 
@@ -271,14 +258,14 @@ class BaseRecycler:
           element_score: score of each element in feature map in the spatial dim.
           neuron_score: score of feature map
         """
+
         reduce_axes = list(range(activation.ndim - 1))
-        if self.sub_mean_score or is_cbp:
+        if self.sub_mean_score:
             activation = activation - torch.mean(activation, dim=reduce_axes)
 
         score = torch.mean(torch.abs(activation), dim=reduce_axes)
-        if not is_cbp:
-            # Normalize so that all scores sum to one.
-            score /= torch.mean(score) + 1e-9
+        # Normalize so that all scores sum to one.
+        score /= torch.sum(score) + 1e-9
 
         return score
 
@@ -297,9 +284,9 @@ class NeuronRecycler(BaseRecycler):
         outgoing_scale: scalar for outgoing weights.
     """
 
-    def __init__(self, all_layers_names, init_method_outgoing='zero', weight_scaling=False,
-                 incoming_scale=1.0, outgoing_scale=1.0, network='nature', **kwargs):
-        super(NeuronRecycler, self).__init__(all_layers_names, **kwargs)
+    def __init__(self, all_layers_names, reset_layer_names, next_layers, init_method_outgoing='zero', weight_scaling=False,
+                 incoming_scale=1.0, outgoing_scale=1.0):
+        super(NeuronRecycler, self).__init__(all_layers_names)
         self.init_method_outgoing = init_method_outgoing
         self.weight_scaling = weight_scaling
         self.incoming_scale = incoming_scale
@@ -308,12 +295,11 @@ class NeuronRecycler(BaseRecycler):
         # this is needed because neuron recycle reinitalizes both sides
         # (incoming and outgoing weights) of a neuron and needs a point to the
         # outgoing weights.
-        self.next_layers = {}
-        for current_layer, next_layer in zip(all_layers_names[:-1], all_layers_names[1:]):
-            self.next_layers[current_layer] = next_layer
+        self.next_layers = next_layers
+        self.next_layers_keys = list(next_layers.keys())
 
-        # we don't recycle the neurons in the output layer.
-        self.reset_layers = self.reset_layers[:-1]
+        # recycle the neurons in the given layer.
+        self.reset_layers = reset_layer_names
 
     def intersected_dead_neurons_with_last_reset(self, intermediates,
                                                  update_step):
@@ -332,15 +318,11 @@ class NeuronRecycler(BaseRecycler):
         is_update_iter = self.is_update_iter(update_step)
         return is_logging or is_update_iter
 
-    def update_reset_layers(self, reset_start_layer_idx):
-        self.reset_layers = self.all_layers_names[reset_start_layer_idx:]
-        self.reset_layers = self.reset_layers[:-1]
+    def update_weights(self, intermediates, params):
+        new_param = self.recycle_dead_neurons(intermediates, params)
+        return new_param
 
-    def update_weights(self, intermediates, params, key, opt_state):
-        new_param, opt_state = self.recycle_dead_neurons(intermediates, params, key, opt_state)
-        return new_param, opt_state
-
-    def recycle_dead_neurons(self, intermedieates, params, key, opt_state):
+    def recycle_dead_neurons(self, intermedieates, params_dict):
         """Recycle dead neurons by reinitializing incoming and outgoing connections.
 
         Incoming connections are randomly initialized and outgoing connections
@@ -360,69 +342,51 @@ class NeuronRecycler(BaseRecycler):
         Raises: raise error if init_method_outgoing is not one of the following
         (random, zero).
         """
-        activations_score_dict = flatten_dict(intermedieates, sep='/')
-        param_dict = flatten_dict(params, sep='/')
+        activations_score_dict = {k: intermedieates[k] for k in self.reset_layers}
 
         # create incoming and outgoing masks and reset bias of dead neurons.
         (
             incoming_mask_dict,
             outgoing_mask_dict,
-            incoming_random_keys_dict,
-            outgoing_random_keys_dict,
-            param_dict,
-        ) = self.create_masks(param_dict, activations_score_dict, key)
-
-        params = unflatten_dict(param_dict, sep='/')
-        incoming_random_keys = unflatten_dict(incoming_random_keys_dict, sep='/')
-        if self.init_method_outgoing == 'random':
-            outgoing_random_keys = unflatten_dict(outgoing_random_keys_dict, sep='/')
+            params_dict,
+        ) = self.create_masks(params_dict, activations_score_dict)
 
         # reset incoming weights
-        incoming_mask = unflatten_dict(incoming_mask_dict, sep='/')
-        reinit_fn = functools.partial(weight_reinit_random,
-                                      weight_scaling=self.weight_scaling,
-                                      scale=self.incoming_scale,
-                                      weights_type='incoming')
-        weight_random_reset_fn = torch.jit.script(functools.partial(tensor_tree_map, reinit_fn))
-        params = weight_random_reset_fn(params, incoming_mask, incoming_random_keys)
+        for reset_layer in self.reset_layers:
+            param_key = reset_layer + '.weight'
+            param = params_dict[param_key]
+            incoming_mask = incoming_mask_dict[param_key]
+            params_dict[param_key] = weight_reinit_random(param, incoming_mask, weights_type='incoming')
 
         # reset outgoing weights
-        outgoing_mask = flatten_dict(outgoing_mask_dict, sep='/')
         if self.init_method_outgoing == 'random':
-            reinit_fn = functools.partial(
-                weight_reinit_random,
-                weight_scaling=self.weight_scaling,
-                scale=self.outgoing_scale,
-                weights_type='outgoing')
-            weight_random_reset_fn = torch.jit.script(functools.partial(tensor_tree_map, reinit_fn))
-            params = weight_random_reset_fn(params, outgoing_mask, outgoing_random_keys)
+            for reset_layer in self.reset_layers:
+                if reset_layer in self.next_layers_keys:
+                    next_layer = self.next_layers[reset_layer]
+                    next_param_key = next_layer + '.weight'
+                    next_param = params_dict[next_param_key]
+                    outgoing_mask = outgoing_mask_dict[next_param_key]
+                    params_dict[next_layer] = weight_reinit_random(next_param, outgoing_mask, weights_type='outgoing')
 
         elif self.init_method_outgoing == 'zero':
-            weight_zero_reset_fn = torch.jit.script(functools.partial(tensor_tree_map, weight_reinit_zero))
-            params = weight_zero_reset_fn(params, outgoing_mask)
+            for reset_layer in self.reset_layers:
+                if reset_layer in self.next_layers_keys:
+                    next_layer = self.next_layers[reset_layer]
+                    next_param_key = next_layer + '.weight'
+                    next_param = params_dict[next_param_key]
+                    outgoing_mask = outgoing_mask_dict[next_param_key]
+                    params_dict[next_layer] = weight_reinit_zero(next_param, outgoing_mask)
 
         else:
             raise ValueError(f'Invalid init method: {self.init_method_outgoing}')
 
-        # reset mu, nu of adam optimizer for recycled weights.
-        # ToDo: transform into torch code
-        reset_momentum_fn = torch.jit.script(functools.partial(tensor_tree_map, reset_momentum))
-        new_mu = reset_momentum_fn(opt_state[0][1], incoming_mask)
-        new_mu = reset_momentum_fn(new_mu, outgoing_mask)
-        new_nu = reset_momentum_fn(opt_state[0][2], incoming_mask)
-        new_nu = reset_momentum_fn(new_nu, outgoing_mask)
-        opt_state_list = list(opt_state)
-        opt_state_list[0] = optax.ScaleByAdamState(
-            opt_state[0].count, mu=new_mu, nu=new_nu)
-        opt_state = tuple(opt_state_list)
-        return params, opt_state
+        return params_dict
 
-    def _score2mask(self, activation, param, next_param, key):
-        del key, param, next_param
+    def _score2mask(self, activation):
         score = self.estimate_neuron_score(activation)
         return score <= self.dead_neurons_threshold
 
-    def create_masks(self, param_dict, activations_dict, key):
+    def create_masks(self, param_dict, activations_dict):
         incoming_mask_dict = {
             k: torch.zeros_like(p) if p.dim() != 1 else None
             for k, p in param_dict.items()
@@ -431,52 +395,60 @@ class NeuronRecycler(BaseRecycler):
             k: torch.zeros_like(p) if p.dim() != 1 else None
             for k, p in param_dict.items()
         }
-        ingoing_random_keys_dict = {k: None for k in param_dict}
-        outgoing_random_keys_dict = (
-            {k: None for k in param_dict} if self.init_method_outgoing == 'random' else {}
-        )
 
-        # prepare mask of incoming and outgoing recycled connections
-        for k in self.reset_layers:
-            param_key = 'params/' + k + '/kernel'
+        # Prepare mask of incoming and outgoing recycled connections
+        for reset_layer in self.reset_layers:
+            param_key = reset_layer + '.weight'
             param = param_dict[param_key]
-            next_key = self.next_layers[k]
-            if isinstance(next_key, list):
-                next_key = next_key[0]
-            next_param = param_dict['params/' + next_key + '/kernel']
-            activation = activations_dict[k + '_act/__call__'][0]
-            neuron_mask = self._score2mask(activation, param, next_param, key)
+            activation = activations_dict[reset_layer]
+            neuron_mask = self._score2mask(activation)
 
-            # the for loop handles the case where a layer has multiple next layers
-            # like the case in DrQ where the output layer has multihead.
-            next_keys = (
-                self.next_layers[k]
-                if isinstance(self.next_layers[k], list) else [self.next_layers[k]]
-            )
-            for next_k in next_keys:
-                next_param_key = 'params/' + next_k + '/kernel'
+            # Create weight mask
+            next_param = None
+            next_param_key = None
+            if reset_layer in self.next_layers_keys:
+                next_param_key = self.next_layers[reset_layer] + '.weight'
                 next_param = param_dict[next_param_key]
-                incoming_mask, outgoing_mask = self.create_mask_helper(neuron_mask, param, next_param)
-                incoming_mask_dict[param_key] = incoming_mask
+            incoming_mask, outgoing_mask = self.create_mask_helper(neuron_mask, param, next_param)
+            incoming_mask_dict[param_key] = incoming_mask
+            if next_param_key:
                 outgoing_mask_dict[next_param_key] = outgoing_mask
-                key, subkey = split_key(key)
-                ingoing_random_keys_dict[param_key] = subkey
-                if self.init_method_outgoing == 'random':
-                    key, subkey = split_key(key)
-                    outgoing_random_keys_dict[next_param_key] = subkey
 
             # reset bias
-            bias_key = 'params/' + k + '/bias'
-            new_bias = torch.zeros_like(param_dict[bias_key])
-            param_dict[bias_key] = torch.where(neuron_mask, new_bias, param_dict[bias_key])
+            bias_key = reset_layer + '.bias'
+            curr_bias = param_dict[bias_key]
+            new_bias = torch.zeros_like(curr_bias)
+            param_dict[bias_key] = torch.where(neuron_mask, new_bias, curr_bias)
 
         return (
             incoming_mask_dict,
             outgoing_mask_dict,
-            ingoing_random_keys_dict,
-            outgoing_random_keys_dict,
             param_dict
         )
+
+    def mask_creator(self, expansion_axis, param, neuron_mask):
+        """Create a mask of weight matrix given 1D vector of neurons mask.
+
+        Args:
+            expansion_axis: List containing 1 axis. The dimension to expand the mask
+                for dense layers (weight shape 2D).
+            param: Weight.
+            neuron_mask: 1D mask that represents dead neurons (features).
+
+        Returns:
+            mask: Mask of weight.
+        """
+
+        if expansion_axis == 0:
+            # Incoming weights
+            mask = neuron_mask.unsqueeze(1)
+            mask = mask.expand(-1, param.shape[1])
+        else:
+            # Outgoing weights
+            mask = neuron_mask.unsqueeze(0)
+            mask = mask.expand(param.shape[0], -1)
+
+        return mask
 
     def create_mask_helper(self, neuron_mask, current_param, next_param):
         """Generate incoming and outgoing weight mask given dead neurons mask.
@@ -491,83 +463,8 @@ class NeuronRecycler(BaseRecycler):
             outgoing_mask
         """
 
-        def mask_creator(expansion_axis, expansion_axes, param, neuron_mask):
-            """Create a mask of weight matrix given 1D vector of neurons mask.
-
-            Args:
-                expansion_axis: List containing 1 axis. The dimension to expand the mask
-                    for dense layers (weight shape 2D).
-                expansion_axes: List containing 3 axes. The dimensions to expand the
-                    score for convolutional layers (weight shape 4D).
-                param: Weight.
-                neuron_mask: 1D mask that represents dead neurons (features).
-
-            Returns:
-                mask: Mask of weight.
-            """
-            if param.ndim == 2:
-                axes = expansion_axis
-                # Flatten layer
-                # The size of neuron_mask is the same as the width of the last conv layer.
-                # This conv layer will be flattened and connected to a dense layer.
-                # We repeat each value of a feature map to cover the spatial dimension.
-                if axes[0] == 1 and (param.shape[0] > neuron_mask.shape[0]):
-                    num_repetition = param.shape[0] // neuron_mask.shape[0]
-                    neuron_mask = neuron_mask.repeat(num_repetition)
-            elif param.ndim == 4:
-                axes = expansion_axes
-
-            mask = neuron_mask.unsqueeze(tuple(axes))
-            for i in range(len(axes)):
-                mask = mask.repeat(1, param.shape[axes[i]], 1, 1)
-            return mask
-
-        incoming_mask = mask_creator([0], [0, 1, 2], current_param, neuron_mask)
-        outgoing_mask = mask_creator([1], [0, 1, 3], next_param, neuron_mask)
+        incoming_mask = self.mask_creator(0, current_param, neuron_mask)
+        outgoing_mask = None
+        if next_param is not None:
+            outgoing_mask = self.mask_creator(1, next_param, neuron_mask)
         return incoming_mask, outgoing_mask
-
-
-class NeuronRecyclerScheduled(NeuronRecycler):
-    """Fixed scheduled version of the NeuronRecycler."""
-
-    def __init__(
-            self,
-            *args,
-            score_type='redo',
-            recycle_rate=0.3,
-            **kwargs,
-    ):
-        super(NeuronRecyclerScheduled, self).__init__(*args, **kwargs)
-        self.score_type = score_type
-        self.recycle_rate = recycle_rate
-
-    def _score2mask(self, activation, param, next_param, key):
-        is_cbp = self.score_type == 'cbp'
-        score = self.estimate_neuron_score(activation, is_cbp=is_cbp)
-        if self.score_type == 'redo':
-            pass
-
-        elif self.score_type == 'redo_inverted':
-            score = -score
-
-        # Metric used in Continual Backprop pape.
-        elif self.score_type == 'cbp':
-            next_axes = list(range(param.ndim))
-            del next_axes[-2]
-            current_axes = list(range(param.ndim))
-            del current_axes[-1]
-            if next_param.ndim == 2 and param.ndim == 4:
-                new_shape = activation.shape[1:] + (-1,)
-                next_param = next_param.reshape(new_shape)
-            score *= torch.sum(torch.abs(next_param), dim=next_axes) / torch.sum(torch.abs(param), dim=current_axes)
-
-        multiplier = max(0, self._last_update_step / self.reset_end_step)
-        ones_fraction = float(torch.cos(torch.pi * 0.5 * multiplier))
-        ones_fraction *= self.recycle_rate
-        logging.info(
-            'score_type: %s, multiplier: %f, ones_fraction=%f',
-            self.score_type,
-            multiplier,
-            ones_fraction,
-        )
-        return leastk_mask(score, ones_fraction)
