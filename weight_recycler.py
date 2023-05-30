@@ -1,34 +1,7 @@
+import copy
 import functools
 import torch
 import torch.nn as nn
-import optax
-import logging
-
-
-def leastk_mask(scores, ones_fraction):
-    """Given a tensor of scores creates a binary mask.
-
-    Args:
-        scores: top-scores are kept
-        ones_fraction: float, of the generated mask.
-
-    Returns:
-        tensor, same shape and type as scores or None.
-    """
-    if ones_fraction is None or ones_fraction == 0:
-        return torch.zeros_like(scores)
-
-    # This is to ensure indices with smallest values are selected.
-    scores = -scores
-
-    n_ones = torch.round(torch.numel(scores) * ones_fraction)
-    k = torch.maximum(1, n_ones).to(torch.int32)
-    flat_scores = scores.view(-1)
-    threshold, _ = torch.sort(flat_scores)
-    threshold = threshold[-k]
-
-    mask = (flat_scores >= threshold).to(flat_scores.dtype)
-    return mask.view(scores.shape)
 
 
 def reset_momentum(momentum, mask):
@@ -135,17 +108,17 @@ class BaseRecycler:
     def is_update_iter(self, step):
         return step > 0 and (step % self.reset_period == 0)
 
-    def update_weights(self, intermediates, params):
+    def update_weights(self, intermediates, params, opt_state):
         raise NotImplementedError
 
-    def maybe_update_weights(self, update_step, intermediates, params):
+    def maybe_update_weights(self, update_step, intermediates, params, opt_state):
         self._last_update_step = update_step
         if self.is_reset(update_step):
-            new_params = self.update_weights(intermediates, params)
+            new_params, new_opt_state = self.update_weights(intermediates, params, opt_state)
         else:
-            new_params = params
+            new_params, new_opt_state = params, opt_state
 
-        return new_params
+        return new_params, new_opt_state
 
     def is_reset(self, update_step):
         del update_step
@@ -284,7 +257,7 @@ class NeuronRecycler(BaseRecycler):
         outgoing_scale: scalar for outgoing weights.
     """
 
-    def __init__(self, all_layers_names, reset_layer_names, next_layers, init_method_outgoing='zero',
+    def __init__(self, all_layers_names, reset_layer_names, reset_layer_idx, next_layers, init_method_outgoing='zero',
                  weight_scaling=False, incoming_scale=1.0, outgoing_scale=1.0,
                  reset_period=200_000):
         super(NeuronRecycler, self).__init__(all_layers_names, reset_period=reset_period)
@@ -301,6 +274,7 @@ class NeuronRecycler(BaseRecycler):
 
         # recycle the neurons in the given layer.
         self.reset_layers = reset_layer_names
+        self.reset_layers_idx = reset_layer_idx
 
     def intersected_dead_neurons_with_last_reset(self, intermediates,
                                                  update_step):
@@ -319,11 +293,11 @@ class NeuronRecycler(BaseRecycler):
         is_update_iter = self.is_update_iter(update_step)
         return is_logging or is_update_iter
 
-    def update_weights(self, intermediates, params):
-        new_param = self.recycle_dead_neurons(intermediates, params)
-        return new_param
+    def update_weights(self, intermediates, params, opt_state):
+        new_param, opt_state = self.recycle_dead_neurons(intermediates, params, opt_state)
+        return new_param, opt_state
 
-    def recycle_dead_neurons(self, intermedieates, params_dict):
+    def recycle_dead_neurons(self, intermedieates, params_dict, opt_state):
         """Recycle dead neurons by reinitializing incoming and outgoing connections.
 
         Incoming connections are randomly initialized and outgoing connections
@@ -352,40 +326,61 @@ class NeuronRecycler(BaseRecycler):
             params_dict,
         ) = self.create_masks(params_dict, activations_score_dict)
 
-        # reset incoming weights
+        param_state = opt_state['state']
+
+        # reset incoming weights, bias and momentum of optimizer
         for reset_layer in self.reset_layers:
             param_key = reset_layer + '.weight'
             param = params_dict[param_key]
             incoming_mask = incoming_mask_dict[param_key]
             params_dict[param_key] = weight_reinit_random(param, incoming_mask, weights_type='incoming')
 
-        # reset outgoing weights
-        if self.init_method_outgoing == 'random':
-            for reset_layer in self.reset_layers:
-                if reset_layer in self.next_layers_keys:
-                    next_layer = self.next_layers[reset_layer]
-                    next_param_key = next_layer + '.weight'
-                    next_param = params_dict[next_param_key]
-                    outgoing_mask = outgoing_mask_dict[next_param_key]
+            param_idx = self.reset_layers_idx[param_key]
+            param_state[param_idx]['exp_avg'] = reset_momentum(param_state[param_idx]['exp_avg'],
+                                                               incoming_mask_dict[param_key])
+            param_state[param_idx]['exp_avg_sq'] = reset_momentum(param_state[param_idx]['exp_avg_sq'],
+                                                                  incoming_mask_dict[param_key])
+
+            bias_key = reset_layer + '.bias'
+            bias = params_dict[bias_key]
+            incoming_mask = incoming_mask_dict[bias_key]
+            params_dict[bias_key] = weight_reinit_zero(bias, incoming_mask)
+
+            bias_idx = self.reset_layers_idx[bias_key]
+            param_state[bias_idx]['exp_avg'] = reset_momentum(param_state[bias_idx]['exp_avg'],
+                                                              incoming_mask_dict[bias_key])
+            param_state[bias_idx]['exp_avg_sq'] = reset_momentum(param_state[bias_idx]['exp_avg_sq'],
+                                                                 incoming_mask_dict[bias_key])
+
+        # reset outgoing weights and momentum of optimizer
+        for reset_layer in self.reset_layers:
+            if reset_layer in self.next_layers_keys:
+                next_layer = self.next_layers[reset_layer]
+                next_param_key = next_layer + '.weight'
+                next_param = params_dict[next_param_key]
+                outgoing_mask = outgoing_mask_dict[next_param_key]
+
+                if self.init_method_outgoing == 'random':
                     params_dict[next_layer] = weight_reinit_random(next_param, outgoing_mask, weights_type='outgoing')
-
-        elif self.init_method_outgoing == 'zero':
-            for reset_layer in self.reset_layers:
-                if reset_layer in self.next_layers_keys:
-                    next_layer = self.next_layers[reset_layer]
-                    next_param_key = next_layer + '.weight'
-                    next_param = params_dict[next_param_key]
-                    outgoing_mask = outgoing_mask_dict[next_param_key]
+                elif self.init_method_outgoing == 'zero':
                     params_dict[next_layer] = weight_reinit_zero(next_param, outgoing_mask)
+                else:
+                    raise ValueError(f'Invalid init method: {self.init_method_outgoing}')
 
-        else:
-            raise ValueError(f'Invalid init method: {self.init_method_outgoing}')
+                next_param_idx = self.reset_layers_idx[next_param_key]
+                param_state[next_param_idx]['exp_avg'] = reset_momentum(param_state[next_param_idx]['exp_avg'],
+                                                                        outgoing_mask_dict[next_param_key])
+                param_state[next_param_idx]['exp_avg_sq'] = reset_momentum(param_state[next_param_idx]['exp_avg_sq'],
+                                                                           outgoing_mask_dict[next_param_key])
 
-        return params_dict
+        opt_state['state'] = param_state
+
+        return params_dict, opt_state
 
     def _score2mask(self, activation):
         score = self.estimate_neuron_score(activation)
-        return score <= self.dead_neurons_threshold
+        mask = score <= self.dead_neurons_threshold
+        return mask.float()
 
     def create_masks(self, param_dict, activations_dict):
         incoming_mask_dict = {
@@ -415,11 +410,9 @@ class NeuronRecycler(BaseRecycler):
             if next_param_key:
                 outgoing_mask_dict[next_param_key] = outgoing_mask
 
-            # reset bias
+            # Create bias mask
             bias_key = reset_layer + '.bias'
-            curr_bias = param_dict[bias_key]
-            new_bias = torch.zeros_like(curr_bias)
-            param_dict[bias_key] = torch.where(neuron_mask, new_bias, curr_bias)
+            incoming_mask_dict[bias_key] = neuron_mask
 
         return (
             incoming_mask_dict,

@@ -1,12 +1,14 @@
+import copy
+
 import torch
 import torch.nn as nn
 from weight_recycler import NeuronRecycler
 
 
-def test_neuron_recycler(model, all_layer_names, reset_layers, next_layers, optimizer):
-    weight_recycler = NeuronRecycler(all_layer_names, reset_layers, next_layers, reset_period=100)
+def neuron_recycler_test(model, all_layer_names, reset_layers, reset_layers_idx, next_layers, optimizer):
+    weight_recycler = NeuronRecycler(all_layer_names, reset_layers, reset_layers_idx, next_layers, reset_period=100)
     loss_func = nn.CrossEntropyLoss()
-    for training_step in range(0, 201):
+    for training_step in range(0, 200):
         optimizer.zero_grad()
 
         test_input = torch.randn(8, 10)
@@ -20,13 +22,21 @@ def test_neuron_recycler(model, all_layer_names, reset_layers, next_layers, opti
         intermediates = model.intermediate_results
         log_dict_neurons = (weight_recycler.maybe_log_deadneurons(0, intermediates))
         old_online_params = model.state_dict()
-        online_params = weight_recycler.maybe_update_weights(training_step, intermediates, old_online_params)
+
+        opt_state = optimizer.state_dict()
+        old_param_state = copy.deepcopy(opt_state['state'])
+        online_params, opt_state = weight_recycler.maybe_update_weights(training_step, intermediates, old_online_params, opt_state)
+        param_state = opt_state['state']
+
+        if training_step % 100 == 0 and training_step > 0:
+            for key in param_state.keys():
+                print('-----------------------\n', key)
+                value1, value2 = param_state[key], old_param_state[key]
+                print(torch.allclose(value1['exp_avg'], value2['exp_avg']))
+                print(torch.allclose(value1['exp_avg_sq'], value2['exp_avg_sq']))
 
         model.load_state_dict(online_params)
-
-    # Reset momentum in optimizer
-    optimizer_state = optimizer.state_dict()
-    print(optimizer_state['state'].keys())
+        optimizer.load_state_dict(opt_state)
 
 
 class MyModel(nn.Module):
@@ -82,7 +92,15 @@ class MyModel(nn.Module):
 
 if __name__ == "__main__":
     model = MyModel()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+    param_index_dict = {}
+    params = []
+    for i, layer in enumerate(model.named_parameters()):
+        layer_name, layer_param = layer
+        param_index_dict[layer_name] = i
+        params.append(layer_param)
+
+    optimizer = torch.optim.Adam(iter(params), lr=0.01)
 
     # Get all layer names (Without activation layer)
     layer_names = []
@@ -104,4 +122,4 @@ if __name__ == "__main__":
             reset_layers.append(current_layer)
             reset_layers.append(next_layer)
 
-    test_neuron_recycler(model, layer_names, reset_layers, next_layers, optimizer)
+    neuron_recycler_test(model, layer_names, reset_layers, param_index_dict, next_layers, optimizer)
